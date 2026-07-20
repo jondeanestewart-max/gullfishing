@@ -50,6 +50,8 @@ header{border-bottom:1px solid var(--line);padding-bottom:16px;margin-bottom:18p
 .flag{border-left:3px solid var(--alert);background:rgba(216,96,74,.1);padding:10px 14px;margin-bottom:8px;font-size:14px}
 .flag.warm{border-color:var(--sonar);background:rgba(232,163,61,.1)}
 .flag.info{border-color:var(--go);background:rgba(26,152,80,.12)}
+.flag.ok{border-left:3px solid var(--go);background:rgba(26,152,80,.16);padding:12px 14px;font-size:14.5px;margin-bottom:8px}
+.flag.err{border-left:3px solid var(--no);background:rgba(215,48,39,.14);padding:12px 14px;font-size:14.5px;margin-bottom:8px}
 
 .ribbon-wrap{margin:30px 0 10px}
 .ribbon{position:relative;width:100%;height:112px;display:block;border:1px solid var(--line);background:var(--deep)}
@@ -165,6 +167,7 @@ h3.sub{font-family:'Barlow Condensed',sans-serif;font-size:19px;text-transform:u
 
 <section class="panel">
   <h2>Trip log</h2>
+  <div id="lg-flash"></div>
   <p class="muted" style="margin-top:0;font-size:14px">
     Every trip saves a snapshot of the conditions the app saw at that moment. That
     snapshot is the point — it's what lets the scores be checked against reality later.
@@ -264,10 +267,14 @@ async function syncLog(push){
     if(Array.isArray(merged.trips)) store.set('trips',merged.trips);
     if(Array.isArray(merged.readings)) store.set('wt_readings',merged.readings);
     const who=new Set([...(merged.trips||[]),...(merged.readings||[])].map(x=>x&&x.who).filter(Boolean));
+    const fs2=document.getElementById('flash-sync');
+    if(fs2) fs2.innerHTML='Shared with every device.';
     syncState={status:'ok',people:who.size,
       msg:`Shared log · ${(merged.trips||[]).length} trip${(merged.trips||[]).length===1?'':'s'}, ${(merged.readings||[]).length} water reading${(merged.readings||[]).length===1?'':'s'}${who.size>1?` from ${who.size} people`:''}`};
     renderLog(); renderWt(); refresh();
   }catch(e){
+    const fs3=document.getElementById('flash-sync');
+    if(fs3) fs3.innerHTML='<strong>Saved on this phone only — not shared yet.</strong>';
     syncState={status:'off',people:syncState.people,
       msg:'Working offline — saved on this device only. It will sync when you next open the page with a connection.'};
   }
@@ -917,6 +924,51 @@ function render(){
 }
 
 /* ---------- 14. LOG RENDERING ---------- */
+let flashTimer=null;
+function flash(html,kind){
+  const el=document.getElementById('lg-flash');
+  if(!el) return;
+  el.innerHTML=`<div class="flag ${kind||'ok'}" style="margin-bottom:14px">${html}</div>`;
+  el.scrollIntoView({behavior:'smooth',block:'nearest'});
+  clearTimeout(flashTimer);
+  if(kind!=='err') flashTimer=setTimeout(()=>{el.innerHTML='';},12000);
+}
+
+/* Held in memory only, never stored — asked once per session. */
+let deletePw=null;
+async function deleteEntry(kind,id){
+  const what=kind==='trips'?'trip':'water reading';
+  if(!confirm(`Delete this ${what}? It is removed for everyone, on every device.`)) return;
+  if(!deletePw) deletePw=prompt(`Password to delete the ${what}:`);
+  if(!deletePw) return;
+
+  const key=kind==='trips'?'trips':'wt_readings';
+  const before=store.get(key,[]);
+  store.set(key,before.filter(x=>String(x.id)!==String(id)));
+  renderLog(); renderWt();
+
+  try{
+    const r=await fetch(SYNC_URL,{method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({trips:store.get('trips',[]),readings:store.get('wt_readings',[]),
+        delete:{[kind]:[Number(id)]},password:deletePw})});
+    if(r.status===403){
+      deletePw=null; store.set(key,before); renderLog(); renderWt();
+      flash('Wrong password — nothing was deleted.','err'); return;
+    }
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const merged=await r.json();
+    if(Array.isArray(merged.trips)) store.set('trips',merged.trips);
+    if(Array.isArray(merged.readings)) store.set('wt_readings',merged.readings);
+    flash(`Deleted. The shared log now holds ${(merged.trips||[]).length} trip${(merged.trips||[]).length===1?'':'s'}.`,'ok');
+    renderLog(); renderWt(); refresh();
+  }catch(e){
+    /* Without reaching the server there is no tombstone, so the entry would come
+       straight back on the next sync. Better to undo it than to lie. */
+    store.set(key,before); renderLog(); renderWt();
+    flash('Could not reach the shared log, so nothing was deleted. Deleting needs a connection.','err');
+  }
+}
+
 /* A1 migration: entries written before v2.1 assume one angler on one rod. */
 /* Migration: pre-v2.2 entries stored rods separately; one rod per angler, so an
    older entry's rod count is its angler count. */
@@ -972,7 +1024,8 @@ function renderLog(){
     : list.slice(0,10).map(t=>`<div class="logitem">
         <span>${new Date(t.when).toLocaleDateString('en-CA',{dateStyle:'medium'})} · ${SITE[t.spot]?SITE[t.spot].label:t.spot} · ${t.hours}h × ${t.anglers} angler${t.anglers>1?'s':''}
           <span class="muted">${t.walleye}W ${t.pike}P${t.who&&t.who!=='me'?' · '+t.who:''}</span></span>
-        <span class="mono">score ${t.snapshot.score}</span></div>`).join('');
+        <span class="mono">score ${t.snapshot?t.snapshot.score:'—'}
+          <button class="btn ghost" style="padding:2px 8px;font-size:12px;height:24px;margin-left:6px" data-trip-del="${t.id}">Delete</button></span></div>`).join('');
   renderBackup(list);
   renderEval(list);
 }
@@ -1080,8 +1133,11 @@ document.getElementById('wt-add').addEventListener('click',()=>{
 });
 document.getElementById('wt-list').addEventListener('click',e=>{
   const id=e.target.dataset.wtdel; if(!id) return;
-  store.set('wt_readings',store.get('wt_readings',[]).filter(r=>String(r.id)!==id));
-  renderWt(); refresh();
+  deleteEntry('readings',id);
+});
+document.getElementById('lg-list').addEventListener('click',e=>{
+  const id=e.target.dataset.tripDel; if(!id) return;
+  deleteEntry('trips',id);
 });
 
 document.getElementById('lg-add').addEventListener('click',()=>{
@@ -1116,6 +1172,12 @@ document.getElementById('lg-add').addEventListener('click',()=>{
   const t=trips(); t.push(trip); saveTrips(t);
   store.set('who',trip.who);
   document.getElementById('lg-notes').value='';
+  document.getElementById('lg-wall').value=0;
+  document.getElementById('lg-pike').value=0;
+  const caught=trip.walleye+trip.pike;
+  flash(`<strong>Trip logged.</strong> ${SITE[trip.spot].label}, ${trip.hours} h, ${trip.anglers} angler${trip.anglers>1?'s':''} —
+    ${trip.walleye} walleye and ${trip.pike} pike${caught?` (${(caught/(trip.hours*trip.anglers)).toFixed(2)} per angler-hour)`:', a blank'}.
+    Conditions saved at a score of ${trip.snapshot.score}. <span id="flash-sync">Syncing…</span>`,'ok');
   renderLog(); syncLog();
 });
 /* Merge someone else's export into this one. Keyed on id (a timestamp at creation),
